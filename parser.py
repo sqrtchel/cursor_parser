@@ -82,9 +82,9 @@ class DocumentParser:
                     self.groups["Год поставки"].append(year)
                 else:
                     self.groups["Год поставки"].append("Год не найден")
-                    print(f"  ⚠️ Год не извлечен из даты {delivery_date}")
+                    print(f"   Год не извлечен из даты {delivery_date}")
             else:
-                print("  ⚠️ Период поставки не найден на странице")
+                print("   Период поставки не найден на странице")
                 #добавляем заглушки, если группы еще пусты
                 if not self.groups["Период поставки"]:
                     self.groups["Период поставки"].append("Период поставки не найден")
@@ -214,7 +214,7 @@ class DocumentParser:
                 return found_date, period_text
 
         # если ни одно вхождение не дало даты, пробуем найти любую дату на странице
-        print("    ❌ Ни в одном вхождении дата не найдена")
+        print("    Ни в одном вхождении дата не найдена")
         print("    Ищем любую дату на странице...")
 
         all_dates = re.findall(r'\d{2}\.\d{2}\.\d{4}', full_text)
