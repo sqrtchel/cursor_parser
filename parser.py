@@ -1,3 +1,5 @@
+import sys
+import argparse
 import os
 import requests
 from bs4 import BeautifulSoup
@@ -5,6 +7,11 @@ from urllib.parse import urljoin
 import docx
 from tempfile import NamedTemporaryFile
 import re
+import pyodbc
+from dotenv import load_dotenv
+
+# Загружаем переменные окружения
+load_dotenv()
 
 
 class DocumentParser:
@@ -253,35 +260,156 @@ class DocumentParser:
 
 
 
-def main():
+def get_args():
+    #Настройка аргументов командной строки
+    ap = argparse.ArgumentParser(description="Парсер для закупок")
+    ap.add_argument('--mode', required=True, choices=['file', 'db'],
+                    help='Режим ввода данных. Из файла или базы данных.')
+    ap.add_argument('--input', type=str, help='Путь к файлу с номерами закупок (для режима file)')
+    return ap.parse_args()
 
-    parser = DocumentParser()
 
-    number = input("Введите номер закупки: ").strip()
+def read_numbers_from_file(file_path):
+    #Чтение номеров закупок из файла
+    if not os.path.exists(file_path):
+        print(f"Ошибка: Файл {file_path} не найден.")
+        return []
+    
+    with open(file_path, 'r', encoding='utf-8') as f:
+        # Читаем строки, удаляем пробелы и пустые строки
+        numbers = [line.strip() for line in f if line.strip()]
+    return numbers
 
+
+def get_db_connection():
+    #Создает подключение к БД, используя параметры из .env
     try:
-
-        groups = parser.parse_by_number(number)
-
-
-        for group_name, paragraphs in groups.items():
-            print(f"\n{group_name}")
-            print(f"   Количество абзацев: {len(paragraphs)}")
-            print("-" * 50)
-
-            if paragraphs:
-                for i, p in enumerate(paragraphs, 1):
-                    # сокращаем длинные абзацы для вывода
-                    if len(p) > 150:
-                        p = p[:150] + "..."
-                    print(f"{i}. {p}")
-            else:
-                print("   (нет абзацев в этой группе)")
-
+        conn_str = (
+            f"DRIVER={os.getenv('DB_DRIVER', '{SQL Server}')};"
+            f"SERVER={os.getenv('DB_SERVER')};"
+            f"DATABASE={os.getenv('DB_DATABASE')};"
+            f"UID={os.getenv('DB_USERNAME')};"
+            f"PWD={os.getenv('DB_PASSWORD')};"
+        )
+        return pyodbc.connect(conn_str)
     except Exception as e:
-        print(f"Ошибка: {e}")
+        print(f"Ошибка при подключении к БД: {e}")
+        return None
 
+
+def get_numbers_from_db():
+    #Получение номеров закупок из БД (таблица ProcurementInput)
+    print(">>> Попытка получения данных из БД...")
+    
+    conn = get_db_connection()
+    if not conn:
+        print(">>> Подключение к БД не удалось, возвращаем тестовый список.")
+        return ["32413348100", "0373200041524000850"]
+    
+    try:
+        cursor = conn.cursor()
+        # Предполагаем, что есть таблица ProcurementInput с колонкой RegNumber
+        query = "SELECT RegNumber FROM ProcurementInput WHERE Processed = 0"
+        cursor.execute(query)
+        numbers = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return numbers
+    except Exception as e:
+        print(f"Ошибка при выполнении запроса к БД: {e}")
+        return ["32413348100", "0373200041524000850"]
+
+
+def save_to_db(number, data):
+    #Сохранение результатов в БД (таблица ProcurementResults)
+    print(f">>> Сохранение результатов для закупки {number} в БД...")
+    
+    conn = get_db_connection()
+    if not conn:
+        print(f">>> Подключение к БД не удалось. Данные для {number} не сохранены.")
+        return
+    
+    try:
+        cursor = conn.cursor()
+        
+        # Пример INSERT запроса
+        query = """
+        INSERT INTO ProcurementResults (
+            RegNumber, FinanceSource, ShelfLife, PaymentTerms, DeliveryTerms, 
+            ContractDateNote, ContractDate, DeliveryPeriod, DeliveryYear
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """
+        
+        # Извлекаем данные из словаря data (parser.groups)
+        # Группы могут содержать списки абзацев, объединяем их в один текст
+        fs = "\n".join(data.get("Источник финансирования", []))
+        sl = "\n".join(data.get("Требования к сроку годности", []))
+        pt = "\n".join(data.get("Порядок оплаты товаров", []))
+        dt = "\n".join(data.get("Условия поставки", []))
+        cdn = "\n".join(data.get("Примечание к сроку действия контракта", []))
+        cd = "\n".join(data.get("Срок действия контракта", []))
+        dp = "\n".join(data.get("Период поставки", []))
+        dy = "\n".join(data.get("Год поставки", []))
+
+        cursor.execute(query, (number, fs, sl, pt, dt, cdn, cd, dp, dy))
+        
+        # Помечаем как обработанное в исходной таблице
+        cursor.execute("UPDATE ProcurementInput SET Processed = 1 WHERE RegNumber = ?", (number,))
+        
+        conn.commit()
+        conn.close()
+        print(f">>> Данные для {number} успешно сохранены в БД.")
+    except Exception as e:
+        print(f"Ошибка при сохранении в БД: {e}")
+
+
+def main():
+    args = get_args()
+    parser = DocumentParser()
+    
+    numbers = []
+    
+    if args.mode == 'file':
+        if not args.input:
+            print("Ошибка: Для режима 'file' необходимо указать путь к файлу через --input")
+            return
+        numbers = read_numbers_from_file(args.input)
+    elif args.mode == 'db':
+        numbers = get_numbers_from_db()
+
+    if not numbers:
+        print("Список номеров для обработки пуст.")
+        return
+
+    print(f"Найдено номеров для обработки: {len(numbers)}")
+
+    for number in numbers:
+        try:
+            # Сбрасываем группы перед каждым новым парсингом
+            parser.groups = {group: [] for group in parser.groups_config.keys()}
+            parser.contract_date = None
+            
+            groups = parser.parse_by_number(number)
+
+            # Вывод в консоль 
+            for group_name, paragraphs in groups.items():
+                print(f"\n{group_name}")
+                print(f"   Количество абзацев: {len(paragraphs)}")
+                print("-" * 50)
+
+                if paragraphs:
+                    for i, p in enumerate(paragraphs, 1):
+                        if len(p) > 150:
+                            p = p[:150] + "..."
+                        print(f"{i}. {p}")
+                else:
+                    print("   (нет абзацев в этой группе)")
+            
+            # Сохранение в БД (заглушка)
+            save_to_db(number, groups)
+
+        except Exception as e:
+            print(f"Ошибка при обработке закупки {number}: {e}")
 
 
 if __name__ == "__main__":
-     main()
+    main()
