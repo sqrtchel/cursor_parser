@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+*.whl
+*.zip
+
+# IDE
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Environment
+.env
+.env.local
+.env.development
+.env.production
+
+# Binaries
+*.exe
+*.dll
+*.dylib
+*.so
+
+# Logs
+*.log
+*.out
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Virtual Environment
+.venv/
+venv/
+env/

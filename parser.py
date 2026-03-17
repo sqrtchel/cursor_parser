@@ -285,11 +285,12 @@ def get_db_connection():
     #Создает подключение к БД, используя параметры из .env
     try:
         conn_str = (
-            f"DRIVER={os.getenv('DB_DRIVER', '{SQL Server}')};"
+            "DRIVER={ODBC Driver 18 for SQL Server};"
             f"SERVER={os.getenv('DB_SERVER')};"
             f"DATABASE={os.getenv('DB_DATABASE')};"
             f"UID={os.getenv('DB_USERNAME')};"
             f"PWD={os.getenv('DB_PASSWORD')};"
+            "TrustServerCertificate=yes;"
         )
         return pyodbc.connect(conn_str)
     except Exception as e:
@@ -308,8 +309,16 @@ def get_numbers_from_db():
     
     try:
         cursor = conn.cursor()
-        # Предполагаем, что есть таблица ProcurementInput с колонкой RegNumber
-        query = "SELECT RegNumber FROM ProcurementInput WHERE Processed = 0"
+
+        # пока в запросе временное определение незаполненных полей происходит по полю l.PlanTval
+        # данная проверка требует доработки
+        query = """SELECT DISTINCT t.NotifNr
+                    FROM Tender t
+                    INNER JOIN Lot l (nolock) on l.Tender_id = t.tender_id
+                    INNER JOIN LotSpec ls (nolock) on ls.lot_id = l.lot_id
+                    WHERE ((FZ_ID = 44 AND NotifNr NOT LIKE '[a-zA-Z]%' AND len(NotifNr) = 19) 
+                    OR (len(NotifNr) = 11 and NotifNr like '3%')) 
+                    AND t.SYSDATE >= DATEADD(minute, -90, GETDATE()) and l.PlanTVal is null"""
         cursor.execute(query)
         numbers = [row[0] for row in cursor.fetchall()]
         conn.close()
@@ -331,31 +340,28 @@ def save_to_db(number, data):
     try:
         cursor = conn.cursor()
         
-        # Пример INSERT запроса
-        query = """
-        INSERT INTO ProcurementResults (
-            RegNumber, FinanceSource, ShelfLife, PaymentTerms, DeliveryTerms, 
-            ContractDateNote, ContractDate, DeliveryPeriod, DeliveryYear
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """
+        # Пример UPDATE запроса
+        # query = """
+        # UPDATE Tender
+        # SET
+        #     RegNumber = ?, FinanceSource = ?, ShelfLife = ?, PaymentTerms = ?, DeliveryTerms = ?,
+        #     ContractDateNote = ?, ContractDate = ?, DeliveryPeriod = ?, DeliveryYear = ?
+        # """
         
         # Извлекаем данные из словаря data (parser.groups)
         # Группы могут содержать списки абзацев, объединяем их в один текст
-        fs = "\n".join(data.get("Источник финансирования", []))
-        sl = "\n".join(data.get("Требования к сроку годности", []))
-        pt = "\n".join(data.get("Порядок оплаты товаров", []))
-        dt = "\n".join(data.get("Условия поставки", []))
-        cdn = "\n".join(data.get("Примечание к сроку действия контракта", []))
-        cd = "\n".join(data.get("Срок действия контракта", []))
-        dp = "\n".join(data.get("Период поставки", []))
-        dy = "\n".join(data.get("Год поставки", []))
+        # fs = "\n".join(data.get("Источник финансирования", []))
+        # sl = "\n".join(data.get("Требования к сроку годности", []))
+        # pt = "\n".join(data.get("Порядок оплаты товаров", []))
+        # dt = "\n".join(data.get("Условия поставки", []))
+        # cdn = "\n".join(data.get("Примечание к сроку действия контракта", []))
+        # cd = "\n".join(data.get("Срок действия контракта", []))
+        # dp = "\n".join(data.get("Период поставки", []))
+        # dy = "\n".join(data.get("Год поставки", []))
 
-        cursor.execute(query, (number, fs, sl, pt, dt, cdn, cd, dp, dy))
+        # cursor.execute(query, (number, fs, sl, pt, dt, cdn, cd, dp, dy))
         
-        # Помечаем как обработанное в исходной таблице
-        cursor.execute("UPDATE ProcurementInput SET Processed = 1 WHERE RegNumber = ?", (number,))
-        
-        conn.commit()
+        # conn.commit()
         conn.close()
         print(f">>> Данные для {number} успешно сохранены в БД.")
     except Exception as e:
@@ -404,8 +410,8 @@ def main():
                 else:
                     print("   (нет абзацев в этой группе)")
             
-            # Сохранение в БД (заглушка)
-            save_to_db(number, groups)
+            # Сохранение в БД (временная заглушка)
+            # save_to_db(number, groups)
 
         except Exception as e:
             print(f"Ошибка при обработке закупки {number}: {e}")
