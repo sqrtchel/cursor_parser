@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 import logging
 from logging.handlers import RotatingFileHandler
 
-# --- Настройка логирования ---
+#настройка логирования
 log_dir = "ParserLogs"
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
@@ -25,7 +25,7 @@ logging.basicConfig(
     format='%(asctime)s | %(levelname)s | %(message)s',
     handlers=[handler, logging.StreamHandler()] # Добавляем вывод в консоль
 )
-# ---------------------------
+
 
 # Загружаем переменные окружения
 load_dotenv()
