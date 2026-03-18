@@ -9,6 +9,23 @@ from tempfile import NamedTemporaryFile
 import re
 import pyodbc
 from dotenv import load_dotenv
+import logging
+from logging.handlers import RotatingFileHandler
+
+# --- Настройка логирования ---
+log_dir = "ParserLogs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+log_file = os.path.join(log_dir, "parser.log")
+handler = RotatingFileHandler(log_file, maxBytes=1*1024*1024, backupCount=3, encoding='utf-8')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s | %(levelname)s | %(message)s',
+    handlers=[handler, logging.StreamHandler()] # Добавляем вывод в консоль
+)
+# ---------------------------
 
 # Загружаем переменные окружения
 load_dotenv()
@@ -36,14 +53,10 @@ class DocumentParser:
     def parse_by_number(self, number):
         # метод принимает номер закупки, формирует URL и парсит данные с двух страниц
 
-        print(f"\nНачинаем парсинг закупки с номером: {number}")
+        logging.info(f"Начинаем парсинг закупки: {number}")
 
         url_documents = f"https://zakupki.gov.ru/epz/order/notice/ea20/view/documents.html?regNumber={number}"
         url_info = f"https://zakupki.gov.ru/epz/order/notice/ok20/view/common-info.html?regNumber={number}"
-
-        #шаг1. ищем и качаем DOCX
-        print(f"\nШаг 1. Обрабатываем страницу документов.")
-        print(f"Переходим по ссылке: {url_documents}")
 
         try:
             headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
@@ -54,7 +67,7 @@ class DocumentParser:
             # ищем и скачиваем DOCX файлы
             doc_links = self._find_docx_links(soup_docs, url_documents)
             if doc_links:
-                print(f"Найдено {len(doc_links)} DOCX файлов.")
+                logging.info(f"Найдено {len(doc_links)} DOCX файлов для закупки {number}.")
                 all_paragraphs = []
                 for link in doc_links:
                     paragraphs = self._read_docx_from_url(link)
@@ -62,14 +75,10 @@ class DocumentParser:
                 # группируем текст из документов
                 self._group_paragraphs(all_paragraphs)
             else:
-                print("DOCX файлы не найдены на странице.")
+                logging.warning(f"DOCX файлы не найдены для закупки {number}.")
 
         except Exception as e:
-            print(f"Ошибка при обработке страницы документов: {e}")
-
-        # шаг2. парсим страницу с общей информацией (ищем дату поставки)
-        print(f"\nШаг 2. Обрабатываем страницу с общей информацией.")
-        print(f"Переходим по ссылке: {url_info}")
+            logging.error(f"Ошибка при обработке страницы документов для {number}: {e}")
 
         try:
             response_info = requests.get(url_info, headers=headers, timeout=15)
@@ -89,9 +98,9 @@ class DocumentParser:
                     self.groups["Год поставки"].append(year)
                 else:
                     self.groups["Год поставки"].append("Год не найден")
-                    print(f"   Год не извлечен из даты {delivery_date}")
+                    logging.warning(f"Год не извлечен из даты {delivery_date} для закупки {number}")
             else:
-                print("   Период поставки не найден на странице")
+                logging.warning(f"Период поставки не найден на странице для закупки {number}")
                 #добавляем заглушки, если группы еще пусты
                 if not self.groups["Период поставки"]:
                     self.groups["Период поставки"].append("Период поставки не найден")
@@ -99,7 +108,7 @@ class DocumentParser:
                     self.groups["Год поставки"].append("Год не найден")
 
         except Exception as e:
-            print(f"Ошибка при обработке страницы с информацией: {e}")
+            logging.error(f"Ошибка при обработке страницы с информацией для {number}: {e}")
             # если страница не открылась, добавляем заглушки в новые группы
             if not self.groups["Период поставки"]:
                 self.groups["Период поставки"].append("Период поставки не найден (ошибка загрузки)")
@@ -124,7 +133,7 @@ class DocumentParser:
                     full_url = urljoin(base_url, href)
                     doc_links.add(full_url)
                 else:
-                    print(f"Найдено название документа: {title}, но нет ссылки")
+                    logging.warning(f"Найдено название документа: {title}, но нет ссылки")
 
         return list(doc_links)
 
@@ -157,7 +166,7 @@ class DocumentParser:
             os.unlink(tmp_path)
 
         except Exception as e:
-            print(f"Ошибка при чтении файла {url}: {e}")
+            logging.error(f"Ошибка при чтении файла {url}: {e}")
 
         return paragraphs
 
@@ -221,12 +230,11 @@ class DocumentParser:
                 return found_date, period_text
 
         # если ни одно вхождение не дало даты, пробуем найти любую дату на странице
-        print("    Ни в одном вхождении дата не найдена")
-        print("    Ищем любую дату на странице...")
+        logging.warning("Ни в одном вхождении 'Срок исполнения контракта' дата не найдена, ищем любую дату на странице...")
 
         all_dates = re.findall(r'\d{2}\.\d{2}\.\d{4}', full_text)
         if all_dates:
-            print(f"    Найдена дата в другом месте: {all_dates[0]}")
+            logging.info(f"Найдена дата в другом месте: {all_dates[0]}")
             return all_dates[0], all_dates[0]
 
         return None, None
@@ -272,12 +280,13 @@ def get_args():
 def read_numbers_from_file(file_path):
     #Чтение номеров закупок из файла
     if not os.path.exists(file_path):
-        print(f"Ошибка: Файл {file_path} не найден.")
+        logging.error(f"Файл {file_path} не найден.")
         return []
     
     with open(file_path, 'r', encoding='utf-8') as f:
         # Читаем строки, удаляем пробелы и пустые строки
         numbers = [line.strip() for line in f if line.strip()]
+    logging.info(f"Из файла {file_path} загружено {len(numbers)} номеров.")
     return numbers
 
 
@@ -294,18 +303,18 @@ def get_db_connection():
         )
         return pyodbc.connect(conn_str)
     except Exception as e:
-        print(f"Ошибка при подключении к БД: {e}")
+        logging.error(f"Ошибка при подключении к БД: {e}")
         return None
 
 
 def get_numbers_from_db():
     #Получение номеров закупок из БД (таблица ProcurementInput)
-    print(">>> Попытка получения данных из БД...")
+    logging.info("Попытка получения данных из БД...")
     
     conn = get_db_connection()
     if not conn:
-        print(">>> Подключение к БД не удалось, возвращаем тестовый список.")
-        return ["32413348100", "0373200041524000850"]
+        logging.error("Подключение к БД не удалось, работа в режиме БД невозможна.")
+        return []
     
     try:
         cursor = conn.cursor()
@@ -322,19 +331,20 @@ def get_numbers_from_db():
         cursor.execute(query)
         numbers = [row[0] for row in cursor.fetchall()]
         conn.close()
+        logging.info(f"Из БД загружено {len(numbers)} номеров для обработки.")
         return numbers
     except Exception as e:
-        print(f"Ошибка при выполнении запроса к БД: {e}")
-        return ["32413348100", "0373200041524000850"]
+        logging.error(f"Ошибка при выполнении запроса к БД: {e}")
+        return []
 
 
 def save_to_db(number, data):
     #Сохранение результатов в БД (таблица ProcurementResults)
-    print(f">>> Сохранение результатов для закупки {number} в БД...")
+    logging.info(f"Сохранение результатов для закупки {number} в БД...")
     
     conn = get_db_connection()
     if not conn:
-        print(f">>> Подключение к БД не удалось. Данные для {number} не сохранены.")
+        logging.error(f"Подключение к БД не удалось. Данные для {number} не сохранены.")
         return
     
     try:
@@ -363,12 +373,13 @@ def save_to_db(number, data):
         
         # conn.commit()
         conn.close()
-        print(f">>> Данные для {number} успешно сохранены в БД.")
+        logging.info(f"Данные для {number} успешно сохранены в БД.")
     except Exception as e:
-        print(f"Ошибка при сохранении в БД: {e}")
+        logging.error(f"Ошибка при сохранении в БД: {e}")
 
 
 def main():
+    logging.info("Запуск парсера.")
     args = get_args()
     parser = DocumentParser()
     
@@ -376,17 +387,17 @@ def main():
     
     if args.mode == 'file':
         if not args.input:
-            print("Ошибка: Для режима 'file' необходимо указать путь к файлу через --input")
+            logging.error("Для режима 'file' необходимо указать путь к файлу через --input")
             return
         numbers = read_numbers_from_file(args.input)
     elif args.mode == 'db':
         numbers = get_numbers_from_db()
 
     if not numbers:
-        print("Список номеров для обработки пуст.")
+        logging.warning("Список номеров для обработки пуст. Завершение работы.")
         return
 
-    print(f"Найдено номеров для обработки: {len(numbers)}")
+    logging.info(f"Всего предстоит обработать закупок: {len(numbers)}")
 
     for number in numbers:
         try:
@@ -395,27 +406,16 @@ def main():
             parser.contract_date = None
             
             groups = parser.parse_by_number(number)
-
-            # Вывод в консоль 
-            for group_name, paragraphs in groups.items():
-                print(f"\n{group_name}")
-                print(f"   Количество абзацев: {len(paragraphs)}")
-                print("-" * 50)
-
-                if paragraphs:
-                    for i, p in enumerate(paragraphs, 1):
-                        if len(p) > 150:
-                            p = p[:150] + "..."
-                        print(f"{i}. {p}")
-                else:
-                    print("   (нет абзацев в этой группе)")
             
             # Сохранение в БД (временная заглушка)
             # save_to_db(number, groups)
+            
+            logging.info(f"Закупка {number} успешно обработана.")
 
         except Exception as e:
-            print(f"Ошибка при обработке закупки {number}: {e}")
+            logging.error(f"Критическая ошибка при обработке закупки {number}: {e}")
 
+    logging.info("Работа парсера завершена.")
 
 if __name__ == "__main__":
     main()
