@@ -50,120 +50,218 @@ class DocumentParser:
         self.contract_date = None
 
 
-    def parse_by_number(self, number):
-        # метод принимает номер закупки, формирует URL и парсит данные с двух страниц
+    def parse_by_number(self, number, provided_url=None):
+        # метод принимает номер закупки и необязательную ссылку на общую информацию
 
-        logging.info(f"Начинаем парсинг закупки: {number}")
+        logging.info(f"Начинаем обработку закупки: {number}")
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
-        url_documents = f"https://zakupki.gov.ru/epz/order/notice/ea20/view/documents.html?regNumber={number}"
-        url_info = f"https://zakupki.gov.ru/epz/order/notice/ok20/view/common-info.html?regNumber={number}"
+        url_documents = None
+        url_info = None
+        info_parsed_successfully = False
 
-        try:
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-            response_docs = requests.get(url_documents, headers=headers, timeout=15)
-            response_docs.raise_for_status()
-            soup_docs = BeautifulSoup(response_docs.text, 'html.parser')
+        # 1. Пробуем использовать предоставленную ссылку (если она есть)
+        if provided_url:
+            logging.info(f"Обнаружена прямая ссылка, пробуем: {provided_url}")
+            url_info = provided_url
+            
+            # Определяем ФЗ по номеру
+            is_223fz = len(str(number)) == 11 and str(number).startswith('3')
+            
+            # Пытаемся извлечь ID из ссылки
+            # Для 223-ФЗ нам нужен только noticeInfoId
+            # Для 44-ФЗ может быть как regNumber
+            notice_match = re.search(r'noticeInfoId=(\d+)', provided_url)
+            reg_match = re.search(r'regNumber=(\d+)', provided_url)
 
-            # ищем и скачиваем DOCX файлы
-            doc_links = self._find_docx_links(soup_docs, url_documents)
-            if doc_links:
-                logging.info(f"Найдено {len(doc_links)} DOCX файлов для закупки {number}.")
-                all_paragraphs = []
-                for link in doc_links:
-                    paragraphs = self._read_docx_from_url(link)
-                    all_paragraphs.extend(paragraphs)
-                # группируем текст из документов
-                self._group_paragraphs(all_paragraphs)
-            else:
-                logging.warning(f"DOCX файлы не найдены для закупки {number}.")
-
-        except Exception as e:
-            logging.error(f"Ошибка при обработке страницы документов для {number}: {e}")
-
-        try:
-            response_info = requests.get(url_info, headers=headers, timeout=15)
-            response_info.raise_for_status()
-            soup_info = BeautifulSoup(response_info.text, 'html.parser')
-
-            delivery_date, delivery_text = self._extract_delivery_period_from_info_page(soup_info)
-
-            #заполняем группы на основе полученных значений
-            if delivery_date and delivery_text:
-                self.groups["Период поставки"].append(delivery_text)
-
-                # Извлекаем год из даты
-                year_match = re.search(r'\d{4}', delivery_date)
-                if year_match:
-                    year = year_match.group()
-                    self.groups["Год поставки"].append(year)
+            # Формируем ссылку на документы
+            if is_223fz:
+                # У 223-ФЗ бывает только noticeInfoId. Если его нет в ссылке, ищем на сайте
+                if notice_match:
+                    url_documents = f"https://zakupki.gov.ru/epz/order/notice/notice223/documents.html?noticeInfoId={notice_match.group(1)}"
                 else:
-                    self.groups["Год поставки"].append("Год не найден")
-                    logging.warning(f"Год не извлечен из даты {delivery_date} для закупки {number}")
-            else:
-                logging.warning(f"Период поставки не найден на странице для закупки {number}")
-                #добавляем заглушки, если группы еще пусты
-                if not self.groups["Период поставки"]:
-                    self.groups["Период поставки"].append("Период поставки не найден")
-                if not self.groups["Год поставки"]:
-                    self.groups["Год поставки"].append("Год не найден")
+                    logging.info(f"В предоставленной ссылке для 223-ФЗ нет noticeInfoId. Запускаем поиск по номеру {number}...")
+                    notice_id = self._get_223fz_notice_id(number)
+                    if notice_id:
+                        url_documents = f"https://zakupki.gov.ru/epz/order/notice/notice223/documents.html?noticeInfoId={notice_id}"
+            else: # 44-ФЗ
+                # У 44-ФЗ бывает только regNumber
+                if reg_match:
+                    url_documents = f"https://zakupki.gov.ru/epz/order/notice/ea20/view/documents.html?regNumber={reg_match.group(1)}"
 
-        except Exception as e:
-            logging.error(f"Ошибка при обработке страницы с информацией для {number}: {e}")
-            # если страница не открылась, добавляем заглушки в новые группы
-            if not self.groups["Период поставки"]:
-                self.groups["Период поставки"].append("Период поставки не найден (ошибка загрузки)")
-            if not self.groups["Год поставки"]:
-                self.groups["Год поставки"].append("Год не найден (ошибка загрузки)")
+            # Пробуем парсить информацию по этой ссылке
+            try:
+                response_info = requests.get(url_info, headers=headers, timeout=15)
+                response_info.raise_for_status()
+                soup_info = BeautifulSoup(response_info.text, 'html.parser')
+                delivery_date, delivery_text = self._extract_delivery_period_from_info_page(soup_info)
+                if delivery_date and delivery_text:
+                    self.groups["Период поставки"].append(delivery_text)
+                    year_match = re.search(r'\d{4}', delivery_date)
+                    self.groups["Год поставки"].append(year_match.group() if year_match else "Год не найден")
+                    info_parsed_successfully = True
+            except Exception as e:
+                logging.error(f"Ошибка при использовании прямой ссылки {url_info}: {e}")
+
+        # 2. Если прямая ссылка не сработала или её не было, запускаем логику по номеру
+        if not info_parsed_successfully:
+            logging.info("Прямая ссылка не сработала или отсутствует. Запускаем логику по номеру.")
+            is_223fz = len(str(number)) == 11 and str(number).startswith('3')
+
+            if is_223fz:
+                notice_id = self._get_223fz_notice_id(number)
+                if notice_id:
+                    url_documents = f"https://zakupki.gov.ru/epz/order/notice/notice223/documents.html?noticeInfoId={notice_id}"
+                    url_info = f"https://zakupki.gov.ru/epz/order/notice/notice223/common-info.html?noticeInfoId={notice_id}"
+                    logging.info(f"Сформированы ссылки для 223-ФЗ по noticeInfoId: {notice_id}")
+                else:
+                    logging.warning(f"Не удалось найти noticeInfoId для 223-ФЗ (номер {number}). Парсинг может быть неполным.")
+            else: # 44-ФЗ
+                url_documents = f"https://zakupki.gov.ru/epz/order/notice/ea20/view/documents.html?regNumber={number}"
+                url_info = f"https://zakupki.gov.ru/epz/order/notice/ok20/view/common-info.html?regNumber={number}"
+
+            # Парсим информацию по сформированным ссылкам
+            if url_info:
+                try:
+                    response_info = requests.get(url_info, headers=headers, timeout=15)
+                    response_info.raise_for_status()
+                    soup_info = BeautifulSoup(response_info.text, 'html.parser')
+                    delivery_date, delivery_text = self._extract_delivery_period_from_info_page(soup_info)
+                    if delivery_date and delivery_text:
+                        self.groups["Период поставки"].append(delivery_text)
+                        year_match = re.search(r'\d{4}', delivery_date)
+                        self.groups["Год поставки"].append(year_match.group() if year_match else "Год не найден")
+                except Exception as e:
+                    logging.error(f"Ошибка при парсинге общей информации по номеру: {e}")
+
+        # 3. Парсинг документов (если ссылка на них была сформирована)
+        if url_documents:
+            try:
+                logging.info(f"Загружаем документы по ссылке: {url_documents}")
+                response_docs = requests.get(url_documents, headers=headers, timeout=15)
+                response_docs.raise_for_status()
+                soup_docs = BeautifulSoup(response_docs.text, 'html.parser')
+                doc_links = self._find_docx_links(soup_docs, url_documents)
+                if doc_links:
+                    logging.info(f"Найдено {len(doc_links)} DOCX файлов.")
+                    all_paragraphs = []
+                    for link in doc_links:
+                        paragraphs = self._read_docx_from_url(link)
+                        all_paragraphs.extend(paragraphs)
+                    self._group_paragraphs(all_paragraphs)
+                else:
+                    logging.warning(f"DOCX файлы не найдены по ссылке {url_documents}.")
+            except Exception as e:
+                logging.error(f"Ошибка при загрузке документов: {e}")
+        else:
+            logging.warning(f"Ссылка на документы не была сформирована для закупки {number}.")
+
+        # Если в итоге ничего не нашли, заполняем заглушками
+        if not self.groups["Период поставки"]:
+            self.groups["Период поставки"].append("Период поставки не найден")
+        if not self.groups["Год поставки"]:
+            self.groups["Год поставки"].append("Год не найден")
 
         self._process_contract_date()
-
         return self.groups
+
+    def _get_223fz_notice_id(self, number):
+        # метод имитирует поиск на сайте закупок для получения noticeInfoId (для 223-ФЗ)
+
+        search_url = f"https://zakupki.gov.ru/epz/order/extendedsearch/results.html?searchString={number}&morphology=on&pageNumber=1&sortDirection=false&recordsPerPage=_10&showLotsInfoHidden=false&sortBy=UPDATE_DATE&fz223=on&af=on&ca=on&pc=on&pa=on"
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+
+        max_repeats = 3
+        for attempt in range(max_repeats):
+            try:
+                logging.info(f"Попытка {attempt + 1} поиска noticeInfoId для 223-ФЗ (номер {number})...")
+                response = requests.get(search_url, headers=headers, timeout=15)
+                response.raise_for_status()
+                soup = BeautifulSoup(response.text, 'html.parser')
+
+                results = soup.find_all('div', class_='search-registry-entry-block')
+                if not results:
+                    # попробуем другой класс, если сайт обновился
+                    results = soup.find_all('div', class_='registry-entry__form')
+
+                for res in results:
+                    # ищем ссылку с классом m-0 или просто ссылку в заголовке
+                    link_node = res.find('a', class_='m-0') or res.find('a', target='_blank')
+                    if link_node and link_node.get('href'):
+                        href = link_node['href']
+                        # вытаскиваем noticeInfoId из href
+                        match = re.search(r'noticeInfoId=(\d+)', href)
+                        if match:
+                            return match.group(1)
+
+                logging.warning(f"Результаты поиска пусты для номера {number} (попытка {attempt + 1})")
+            except Exception as e:
+                logging.error(f"Ошибка при поиске noticeInfoId (попытка {attempt + 1}): {e}")
+
+        return None
 
 
     def _find_docx_links(self, soup, base_url):
-        #метод ищет документы в атрибутах title и других местах
-
         doc_links = set()
 
-        for link in soup.find_all('a', title=True):
-            title = link['title']
-            if '.docx' in title.lower():
-                href = link.get('href', '')
-                if href:
-                    full_url = urljoin(base_url, href)
-                    doc_links.add(full_url)
-                else:
-                    logging.warning(f"Найдено название документа: {title}, но нет ссылки")
+        # Ищем все ссылки на странице
+        for link in soup.find_all('a'):
+            href = link.get('href', '')
+            title = link.get('title', '')
+            text = link.get_text()
 
+            # Проверяем наличие .docx в ссылке, заголовке или тексте
+            is_docx = (
+                '.docx' in href.lower() or 
+                '.docx' in title.lower() or 
+                '.docx' in text.lower()
+            )
+
+            if is_docx and href:
+                # Игнорируем ссылки на внешние ресурсы, если они не ведут на скачивание
+                full_url = urljoin(base_url, href)
+                doc_links.add(full_url)
+                logging.debug(f"Найдена ссылка на DOCX: {full_url}")
+
+        if not doc_links:
+            # Попробуем поискать по кнопкам или иконкам скачивания, если стандартные ссылки не сработали
+            for download_icon in soup.find_all(class_=re.compile(r'download', re.I)):
+                parent_link = download_icon.find_parent('a')
+                if parent_link and parent_link.get('href'):
+                    href = parent_link['href']
+                    if 'downloaddoc' in href.lower():
+                        full_url = urljoin(base_url, href)
+                        doc_links.add(full_url)
+
+        logging.info(f"Итого найдено потенциальных ссылок на документы: {len(doc_links)}")
         return list(doc_links)
 
 
     def _read_docx_from_url(self, url):
         # метод скачивает docx файл по URL и читает его текст
-
         paragraphs = []
-
         try:
-            #скачиваем файл
-            headers = {'User-Agent': 'Mozilla/5.0'}
-            response = requests.get(url, headers=headers, stream=True)
+            logging.info(f"Загрузка документа: {url}")
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+            response = requests.get(url, headers=headers, stream=True, timeout=20)
             response.raise_for_status()
 
-            #создаем временный файл
+            # Проверяем, что скачанный файл похож на docx
+            if response.content[:2] != b'PK':
+                logging.warning(f"Файл по ссылке {url} не является валидным DOCX (отсутствует заголовок ZIP).")
+                return []
+
             with NamedTemporaryFile(delete=False, suffix='.docx') as tmp_file:
                 tmp_file.write(response.content)
                 tmp_path = tmp_file.name
 
-            #читаем документ
             doc = docx.Document(tmp_path)
-
-            #извлекаем текст из всех параграфов
             for paragraph in doc.paragraphs:
-                if paragraph.text.strip():  #пропускаем пустые параграфы
+                if paragraph.text.strip():
                     paragraphs.append(paragraph.text.strip())
 
-            #удаляем временный файл
             os.unlink(tmp_path)
+            logging.info(f"Успешно прочитано {len(paragraphs)} абзацев из {url}")
 
         except Exception as e:
             logging.error(f"Ошибка при чтении файла {url}: {e}")
@@ -278,16 +376,28 @@ def get_args():
 
 
 def read_numbers_from_file(file_path):
-    #Чтение номеров закупок из файла
+    """Чтение данных из файла. Поддерживает форматы:
+    1. Просто номер закупки
+    2. Номер закупки и ссылка через пробел/табуляцию
+    """
     if not os.path.exists(file_path):
         logging.error(f"Файл {file_path} не найден.")
         return []
     
+    results = []
     with open(file_path, 'r', encoding='utf-8') as f:
-        # Читаем строки, удаляем пробелы и пустые строки
-        numbers = [line.strip() for line in f if line.strip()]
-    logging.info(f"Из файла {file_path} загружено {len(numbers)} номеров.")
-    return numbers
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            
+            parts = line.split()
+            number = parts[0]
+            url = parts[1] if len(parts) > 1 else None
+            results.append({'number': number, 'url': url})
+            
+    logging.info(f"Из файла {file_path} загружено {len(results)} записей.")
+    return results
 
 
 def get_db_connection():
@@ -308,7 +418,7 @@ def get_db_connection():
 
 
 def get_numbers_from_db():
-    #Получение номеров закупок из БД (таблица ProcurementInput)
+    #Получение номеров и ссылок закупок из БД
     logging.info("Попытка получения данных из БД...")
     
     conn = get_db_connection()
@@ -319,27 +429,27 @@ def get_numbers_from_db():
     try:
         cursor = conn.cursor()
 
-        # пока в запросе временное определение незаполненных полей происходит по полю l.PlanTval
-        # данная проверка требует доработки
-        query = """SELECT DISTINCT t.NotifNr
+        # Добавляем выборку ссылки (предположим, она в поле l.PlanTval)
+        # Если ссылки нет, поле будет None
+        query = """SELECT DISTINCT t.NotifNr, l.PlanTVal
                     FROM Tender t
                     INNER JOIN Lot l (nolock) on l.Tender_id = t.tender_id
                     INNER JOIN LotSpec ls (nolock) on ls.lot_id = l.lot_id
                     WHERE ((FZ_ID = 44 AND NotifNr NOT LIKE '[a-zA-Z]%' AND len(NotifNr) = 19) 
                     OR (len(NotifNr) = 11 and NotifNr like '3%')) 
-                    AND t.SYSDATE >= DATEADD(minute, -90, GETDATE()) and l.PlanTVal is null"""
+                    AND t.SYSDATE >= DATEADD(minute, -90, GETDATE()) and l.PlanTVal is not null"""
         cursor.execute(query)
-        numbers = [row[0] for row in cursor.fetchall()]
+        results = [{'number': row[0], 'url': row[1]} for row in cursor.fetchall()]
         conn.close()
-        logging.info(f"Из БД загружено {len(numbers)} номеров для обработки.")
-        return numbers
+        logging.info(f"Из БД загружено {len(results)} записей для обработки.")
+        return results
     except Exception as e:
         logging.error(f"Ошибка при выполнении запроса к БД: {e}")
         return []
 
 
 def save_to_db(number, data):
-    #Сохранение результатов в БД (таблица ProcurementResults)
+    #Сохранение результатов в БД
     logging.info(f"Сохранение результатов для закупки {number} в БД...")
     
     conn = get_db_connection()
@@ -399,13 +509,16 @@ def main():
 
     logging.info(f"Всего предстоит обработать закупок: {len(numbers)}")
 
-    for number in numbers:
+    for entry in numbers:
+        number = entry['number']
+        url = entry['url']
         try:
             # Сбрасываем группы перед каждым новым парсингом
             parser.groups = {group: [] for group in parser.groups_config.keys()}
             parser.contract_date = None
             
-            groups = parser.parse_by_number(number)
+            # Передаем и номер, и ссылку в метод парсинга
+            groups = parser.parse_by_number(number, provided_url=url)
             
             # Сохранение в БД (временная заглушка)
             # save_to_db(number, groups)
