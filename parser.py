@@ -429,15 +429,15 @@ def get_numbers_from_db():
     try:
         cursor = conn.cursor()
 
-        # Добавляем выборку ссылки (предположим, она в поле l.PlanTval)
-        # Если ссылки нет, поле будет None
-        query = """SELECT DISTINCT t.NotifNr, l.PlanTVal
-                    FROM Tender t
-                    INNER JOIN Lot l (nolock) on l.Tender_id = t.tender_id
-                    INNER JOIN LotSpec ls (nolock) on ls.lot_id = l.lot_id
+        # Фильтруем те закупки, где l.PlanTVal еще не заполнен (IS NULL)
+        query = """SELECT DISTINCT t.NotifNr, t.SrcInf
+                    FROM [Cursor].[dbo].[Tender] t
+                    INNER JOIN [Cursor].[dbo].[Lot] l (nolock) on l.Tender_id = t.tender_id
+                    INNER JOIN [Cursor].[dbo].[LotSpec] ls (nolock) on ls.lot_id = l.lot_id
                     WHERE ((FZ_ID = 44 AND NotifNr NOT LIKE '[a-zA-Z]%' AND len(NotifNr) = 19) 
                     OR (len(NotifNr) = 11 and NotifNr like '3%')) 
-                    AND t.SYSDATE >= DATEADD(minute, -90, GETDATE()) and l.PlanTVal is not null"""
+                    AND t.SYSDATE >= DATEADD(minute, -90, GETDATE()) 
+                    AND l.PlanTVal IS NULL"""
         cursor.execute(query)
         results = [{'number': row[0], 'url': row[1]} for row in cursor.fetchall()]
         conn.close()
@@ -460,32 +460,45 @@ def save_to_db(number, data):
     try:
         cursor = conn.cursor()
         
-        # Пример UPDATE запроса
-        # query = """
-        # UPDATE Tender
-        # SET
-        #     RegNumber = ?, FinanceSource = ?, ShelfLife = ?, PaymentTerms = ?, DeliveryTerms = ?,
-        #     ContractDateNote = ?, ContractDate = ?, DeliveryPeriod = ?, DeliveryYear = ?
-        # """
-        
-        # Извлекаем данные из словаря data (parser.groups)
-        # Группы могут содержать списки абзацев, объединяем их в один текст
-        # fs = "\n".join(data.get("Источник финансирования", []))
-        # sl = "\n".join(data.get("Требования к сроку годности", []))
-        # pt = "\n".join(data.get("Порядок оплаты товаров", []))
-        # dt = "\n".join(data.get("Условия поставки", []))
-        # cdn = "\n".join(data.get("Примечание к сроку действия контракта", []))
-        # cd = "\n".join(data.get("Срок действия контракта", []))
-        # dp = "\n".join(data.get("Период поставки", []))
-        # dy = "\n".join(data.get("Год поставки", []))
+        # Подготавливаем текстовые данные из найденных групп (объединяем абзацы)
+        fs = "\n".join(data.get("Источник финансирования", []))
+        sl = "\n".join(data.get("Требования к сроку годности", []))
+        pt = "\n".join(data.get("Порядок оплаты товаров", []))
+        dt = "\n".join(data.get("Условия поставки", []))
+        cdn = "\n".join(data.get("Примечание к сроку действия контракта", []))
+        cd = "\n".join(data.get("Срок действия контракта", []))
+        tp = "\n".join(data.get("Период поставки", []))
+        ty = "\n".join(data.get("Год поставки", []))
 
-        # cursor.execute(query, (number, fs, sl, pt, dt, cdn, cd, dp, dy))
+        # 1. Обновляем таблицу [Tender]
+        query_tender = """
+        UPDATE [Cursor].[dbo].[Tender]
+        SET TenderDocReglament = ?, RequirementToExpiryDate = ?
+        WHERE NotifNr = ?
+        """
+        cursor.execute(query_tender, (fs, sl, number))
         
-        # conn.commit()
+        # 2. Обновляем таблицу [Lot]
+        # Обновляем все лоты, связанные с этим номером закупки (через Tender_id)
+        query_lot = """
+        UPDATE l
+        SET l.PaymentReglament = ?, 
+            l.PlanTVal = ?, 
+            l.ContrExpVal = ?, 
+            l.SupplyDt = ?,
+            l.PlanTPeriod = ?,
+            l.PlanTYear = ?
+        FROM [Cursor].[dbo].[Lot] l
+        INNER JOIN [Cursor].[dbo].[Tender] t ON l.Tender_id = t.tender_id
+        WHERE t.NotifNr = ?
+        """
+        cursor.execute(query_lot, (pt, dt, cdn, cd, tp, ty, number))
+        
+        conn.commit()
         conn.close()
-        logging.info(f"Данные для {number} успешно сохранены в БД.")
+        logging.info(f"Данные для {number} успешно сохранены в таблицы Tender и Lot.")
     except Exception as e:
-        logging.error(f"Ошибка при сохранении в БД: {e}")
+        logging.error(f"Ошибка при сохранении в БД для {number}: {e}")
 
 
 def main():
