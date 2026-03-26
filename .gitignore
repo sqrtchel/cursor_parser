@@ -42,3 +42,10 @@ Thumbs.db
 .venv/
 venv/
 env/
+
+# Project Specific
+Данные из базы.xlsx
+~$*.xlsx
+embeddings_cache.pt
+ParserLogs/
+debug_row_820.json

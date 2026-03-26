@@ -4,3 +4,9 @@ python-docx
 lxml
 python-dotenv
 pyodbc
+pymupdf
+openpyxl
+sentence-transformers
+torch
+scikit-learn
+pandas
