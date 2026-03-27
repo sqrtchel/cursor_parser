@@ -351,7 +351,22 @@ class DocumentParser:
         paragraphs = []
         try:
             doc = docx.Document(path)
+            # Извлекаем текст из обычных абзацев
             paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+            
+            # Дополнительно извлекаем текст из всех таблиц в документе
+            for table in doc.tables:
+                for row in table.rows:
+                    row_data = []
+                    for cell in row.cells:
+                        # В одной ячейке может быть несколько абзацев текста
+                        cell_text = " ".join([p.text.strip() for p in cell.paragraphs if p.text.strip()])
+                        if cell_text:
+                            row_data.append(cell_text)
+                    if row_data:
+                        # Объединяем ячейки строки в одну строку для анализа
+                        paragraphs.append(" | ".join(row_data))
+                        
         except Exception as e:
             if not silent:
                 logging.error(f"Ошибка чтения DOCX: {e}")
@@ -392,11 +407,26 @@ class DocumentParser:
             import fitz # PyMuPDF
             doc = fitz.open(path)
             for page in doc:
+                # 1. Извлекаем обычный текст
                 text = page.get_text()
                 # Очистка текста от лишних переносов внутри слов и строк
                 text = re.sub(r'(\w)-\n(\w)', r'\1\2', text)
                 lines = [line.strip() for line in text.split('\n') if line.strip()]
                 paragraphs.extend(lines)
+                
+                # 2. Пытаемся найти таблицы (если есть)
+                try:
+                    tabs = page.find_tables()
+                    for table in tabs:
+                        for row in table.extract():
+                            # Очищаем ячейки от None и лишних пробелов
+                            row_data = [str(cell).strip() for cell in row if cell is not None]
+                            if row_data:
+                                paragraphs.append(" | ".join(row_data))
+                except Exception:
+                    # Некоторые PDF могут не поддерживать поиск таблиц или быть защищены
+                    pass
+                    
             doc.close()
         except ImportError:
             logging.error("Библиотека PyMuPDF (fitz) не установлена.")
