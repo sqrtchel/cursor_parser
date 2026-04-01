@@ -13,7 +13,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 import pandas as pd
 import torch
-from sentence_transformers import SentenceTransformer, util
+from sentence_transformers import SentenceTransformer, util, CrossEncoder
 import numpy as np
 
 #Настройка логирования
@@ -38,14 +38,39 @@ load_dotenv()
 class SemanticAnalyzer:
     """Класс для интеллектуального анализа текста на основе семантической схожести."""
     
-    def __init__(self, excel_path, cache_path="embeddings_cache.pt"):
+    def __init__(
+        self,
+        excel_path,
+        cache_path="embeddings_cache.pt",
+        reranker_model_name=None,
+        enable_reranker=True,
+    ):
         logging.info("Инициализация семантического анализатора...")
         # Используем модель, которая понимает русский язык
         self.model = SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2')
+        self.reranker = None
+        self.reranker_model_name = reranker_model_name or os.getenv(
+            "RERANKER_MODEL",
+            "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1",
+        )
+        self.enable_reranker = enable_reranker
         self.reference_embeddings = {}
         self.excel_path = excel_path
         self.cache_path = cache_path
         self._load_data()
+        self._maybe_init_reranker()
+
+    def _maybe_init_reranker(self):
+        if not self.enable_reranker:
+            logging.info("Cross-энкодер (reranker) отключен настройкой.")
+            return
+        try:
+            logging.info(f"Загрузка cross-энкодера: {self.reranker_model_name} ...")
+            self.reranker = CrossEncoder(self.reranker_model_name)
+            logging.info("Cross-энкодер успешно загружен.")
+        except Exception as e:
+            logging.warning(f"Не удалось загрузить cross-энкодер: {e}. Продолжаем без rerank.")
+            self.reranker = None
 
     def _load_data(self):
         """Загрузка данных: сначала из кеша, если нет - из Excel."""
@@ -113,28 +138,58 @@ class SemanticAnalyzer:
 
     def find_best_sentence(self, sentences, group_name, threshold=0.91):
         """Находит наиболее подходящее предложение для указанной группы."""
-        if not sentences or group_name not in self.reference_embeddings:
+        top = self.find_top_k_sentences(sentences, group_name, top_k=1)
+        if not top:
             return None
-
-        # Кодируем все предложения документа
-        sentence_embeddings = self.model.encode(sentences, convert_to_tensor=True)
-        
-        # Считаем схожесть каждого предложения со всеми эталонами группы
-        cos_scores = util.cos_sim(sentence_embeddings, self.reference_embeddings[group_name])
-        
-        # Для каждого предложения берем максимальную схожесть с любым из эталонов
-        max_scores, _ = torch.max(cos_scores, dim=1)
-        
-        # Находим лучший результат
-        best_idx = torch.argmax(max_scores).item()
-        best_score = max_scores[best_idx].item()
+        best_sentence, best_score = top[0]
 
         if best_score >= threshold:
-            logging.info(f"Найдено совпадение для '{group_name}' (Score: {best_score:.2f}): {sentences[best_idx][:100]}...")
-            return sentences[best_idx]
+            logging.info(f"Найдено совпадение для '{group_name}' (Score: {best_score:.2f}): {best_sentence[:100]}...")
+            return best_sentence
         
         logging.info(f"Для группы '{group_name}' ни одно предложение не прошло порог {threshold}.")
         return None
+
+    def find_top_k_sentences(self, sentences, group_name, top_k=5):
+        """Возвращает top-k кандидатов (предложение, score) по семантической близости."""
+        if not sentences or group_name not in self.reference_embeddings:
+            return []
+
+        # Кодируем все предложения документа
+        sentence_embeddings = self.model.encode(sentences, convert_to_tensor=True)
+
+        # Считаем схожесть каждого предложения со всеми эталонами группы
+        cos_scores = util.cos_sim(sentence_embeddings, self.reference_embeddings[group_name])
+
+        # Для каждого предложения берем максимальную схожесть с любым из эталонов
+        max_scores, _ = torch.max(cos_scores, dim=1)
+
+        k = min(int(top_k), int(max_scores.shape[0]))
+        if k <= 0:
+            return []
+
+        top_scores, top_indices = torch.topk(max_scores, k=k, largest=True)
+        results = []
+        for score_t, idx_t in zip(top_scores.tolist(), top_indices.tolist()):
+            results.append((sentences[idx_t], float(score_t)))
+        return results
+
+    def rerank(self, group_name, candidates):
+        """Rerank кандидатов cross-энкодером"""
+        if not candidates or not self.reranker:
+            return []
+
+        # Запрос формируем из названия группы
+        query = str(group_name).strip()
+        pairs = [(query, c) for c in candidates]
+        try:
+            scores = self.reranker.predict(pairs)
+            scored = list(zip(candidates, [float(s) for s in scores]))
+            scored.sort(key=lambda x: x[1], reverse=True)
+            return scored
+        except Exception as e:
+            logging.warning(f"Ошибка rerank для '{group_name}': {e}")
+            return []
 
 
 class DocumentParser:
@@ -151,6 +206,15 @@ class DocumentParser:
         self.groups = {group: [] for group in self.groups_config.keys()}
         self.contract_date = None
         self.semantic_analyzer = semantic_analyzer
+        self.group_thresholds = {
+            # значения по умолчанию; подбираются на разметке. Можно тонко настроить по группам.
+            "Источник финансирования": 0.88,
+            "Требования к сроку годности": 0.90,
+            "Порядок оплаты товаров": 0.90,
+            "Условия поставки": 0.90,
+            "Примечание к сроку действия контракта": 0.88,
+        }
+        self.top_k_candidates = int(os.getenv("TOP_K_CANDIDATES", "5"))
 
 
     def parse_by_number(self, number, provided_url=None):
@@ -605,18 +669,50 @@ class DocumentParser:
             for group_name in self.groups_config.keys():
                 if group_name == "Срок действия контракта":
                     continue
-                
-                best_sentence = self.semantic_analyzer.find_best_sentence(all_sentences, group_name)
-                
-                if best_sentence:
-                    self.groups[group_name] = [best_sentence]
+
+                threshold = self.group_thresholds.get(group_name, 0.91)
+                top = self.semantic_analyzer.find_top_k_sentences(
+                    all_sentences,
+                    group_name,
+                    top_k=self.top_k_candidates,
+                )
+
+                if top:
+                    # Rerank только top-k, чтобы не тормозить
+                    candidates = [t[0] for t in top]
+                    reranked = self.semantic_analyzer.rerank(group_name, candidates)
+
+                    if reranked:
+                        best_sentence, rerank_score = reranked[0]
+                        logging.info(
+                            f"Rerank: '{group_name}' выбран (Score: {rerank_score:.3f}): {best_sentence[:100]}..."
+                        )
+                       
+                        best_cosine = max(s for (txt, s) in top if txt == best_sentence)
+                        if best_cosine >= threshold:
+                            self.groups[group_name] = [best_sentence]
+                        else:
+                            logging.info(
+                                f"'{group_name}': rerank выбрал кандидата, но cosine {best_cosine:.3f} < порога {threshold:.3f}. Фолбэк на ключевые слова."
+                            )
+                            self._fallback_keyword_search(all_sentences, group_name)
+                    else:
+                        best_sentence, best_score = top[0]
+                        if best_score >= threshold:
+                            logging.info(
+                                f"Semantic: '{group_name}' выбран (Score: {best_score:.3f}): {best_sentence[:100]}..."
+                            )
+                            self.groups[group_name] = [best_sentence]
+                        else:
+                            self._fallback_keyword_search(all_sentences, group_name)
+
                     # Специальная логика для даты
-                    if group_name == "Примечание к сроку действия контракта":
-                        date = self._extract_date(best_sentence)
+                    if self.groups[group_name] and group_name == "Примечание к сроку действия контракта":
+                        date = self._extract_date(self.groups[group_name][0])
                         if date:
                             self.contract_date = date
                 else:
-                    # Если семантика не помогла, пробуем ключевые слова (с более строгим фильтром)
+                    # Если семантика не помогла, пробуем ключевые слова
                     self._fallback_keyword_search(all_sentences, group_name)
         else:
             # Только ключевые слова
