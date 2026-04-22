@@ -1,20 +1,19 @@
-import sys
 import argparse
+import logging
 import os
-import requests
-from bs4 import BeautifulSoup
+import re
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from tempfile import NamedTemporaryFile
 from urllib.parse import urljoin
 import docx
-from tempfile import NamedTemporaryFile
-import re
-import pyodbc
-from dotenv import load_dotenv
-import logging
-from logging.handlers import RotatingFileHandler
 import pandas as pd
+import pyodbc
+import requests
 import torch
+from bs4 import BeautifulSoup
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer, util, CrossEncoder
-import numpy as np
 
 #Настройка логирования
 log_dir = "ParserLogs"
@@ -34,6 +33,7 @@ logging.basicConfig(
 # Загружаем переменные окружения
 load_dotenv()
 
+TIME_BEFORE = -int(os.getenv("TIME_BEFORE", "90"))
 
 class SemanticAnalyzer:
     """Класс для интеллектуального анализа текста на основе семантической схожести."""
@@ -817,16 +817,16 @@ def get_numbers_from_db():
     try:
         cursor = conn.cursor()
 
-        # Фильтруем те закупки, где l.PlanTVal еще не заполнен (IS NULL)
+        # Фильтруем те закупки, где t.PaymentReglament еще не заполнен (IS NULL)
         query = """SELECT DISTINCT t.NotifNr, t.SrcInf
                     FROM [Cursor].[dbo].[Tender] t
                     INNER JOIN [Cursor].[dbo].[Lot] l (nolock) on l.Tender_id = t.tender_id
                     INNER JOIN [Cursor].[dbo].[LotSpec] ls (nolock) on ls.lot_id = l.lot_id
                     WHERE ((FZ_ID = 44 AND NotifNr NOT LIKE '[a-zA-Z]%' AND len(NotifNr) = 19) 
                     OR (len(NotifNr) = 11 and NotifNr like '3%')) 
-                    AND t.SYSDATE >= DATEADD(minute, -90, GETDATE()) 
-                    AND l.PlanTVal IS NULL"""
-        cursor.execute(query)
+                    AND t.SYSDATE >= DATEADD(minute, ?, GETDATE()) 
+                    AND t.PaymentReglament IS NULL"""
+        cursor.execute(query, (TIME_BEFORE,))
         results = [{'number': row[0], 'url': row[1]} for row in cursor.fetchall()]
         conn.close()
         logging.info(f"Из БД загружено {len(results)} записей для обработки.")
@@ -849,30 +849,37 @@ def save_to_db(number, data):
         cursor = conn.cursor()
         
         # Подготавливаем текстовые данные из найденных групп (объединяем абзацы)
-        def get_field_val(group_name):
+        def get_field_val(group_name, default="Нет данных"):
             val = "\n".join(data.get(group_name, []))
-            return val if val.strip() else "Нет данных"
+            return val if val.strip() else default
 
         fs = get_field_val("Источник финансирования")
         sl = get_field_val("Требования к сроку годности")
         pt = get_field_val("Порядок оплаты товаров")
         dt = get_field_val("Условия поставки")
         cdn = get_field_val("Примечание к сроку действия контракта")
-        cd = get_field_val("Срок действия контракта")
+        cd = get_field_val("Срок действия контракта", default=None)
+
+        if cd:
+            try:
+                cd = datetime.strptime(cd.strip(), "%d.%m.%Y").date()
+            except ValueError:
+                logging.warning(f"Не удалось распарсить дату: {cd}")
+                cd = None
 
         # 1. Обновляем таблицу [Tender]
         query_tender = """
         UPDATE [Cursor].[dbo].[Tender]
-        SET TenderDocReglament = ?, RequirementToExpiryDate = ?
+        SET TenderDocReglament = ?, RequirementToExpiryDate = ?, PaymentReglament = ?
         WHERE NotifNr = ?
         """
-        cursor.execute(query_tender, (fs, sl, number))
+        cursor.execute(query_tender, (fs, sl, pt, number))
         
         # 2. Обновляем таблицу [Lot]
         # Обновляем все лоты, связанные с этим номером закупки (через Tender_id)
         query_lot = """
         UPDATE l
-        SET l.PaymentReglament = ?, 
+        SET  
             l.PlanTVal = ?, 
             l.ContrExpVal = ?, 
             l.SupplyDt = ?
@@ -880,7 +887,7 @@ def save_to_db(number, data):
         INNER JOIN [Cursor].[dbo].[Tender] t ON l.Tender_id = t.tender_id
         WHERE t.NotifNr = ?
         """
-        cursor.execute(query_lot, (pt, dt, cdn, cd, number))
+        cursor.execute(query_lot, (dt, cdn, cd, number))
         
         conn.commit()
         conn.close()
@@ -920,6 +927,8 @@ def main():
         return
 
     logging.info(f"Всего предстоит обработать закупок: {len(numbers)}")
+    numbers_block = "\n".join(str(number['number']) for number in numbers)
+    logging.info(f"Список номеров:\n{numbers_block}")
 
     for entry in numbers:
         number = entry['number']
@@ -933,14 +942,14 @@ def main():
             groups = parser.parse_by_number(number, provided_url=url)
             
             # Временный принт результатов для отладки
-            print(f"\n--- РЕЗУЛЬТАТЫ ДЛЯ {number} ---")
-            for group_name, sentences in groups.items():
-                content = sentences[0] if sentences else "Нет данных"
-                print(f"[{group_name}]: {content}")
-            print("-" * 30 + "\n")
+            # print(f"\n--- РЕЗУЛЬТАТЫ ДЛЯ {number} ---")
+            # for group_name, sentences in groups.items():
+            #     content = sentences[0] if sentences else "Нет данных"
+            #     print(f"[{group_name}]: {content}")
+            # print("-" * 30 + "\n")
             
             # Сохранение в БД (временная заглушка)
-            # save_to_db(number, groups)
+            save_to_db(number, groups)
             
             logging.info(f"Закупка {number} успешно обработана.")
 
