@@ -207,7 +207,7 @@ class DocumentParser:
         self.contract_date = None
         self.semantic_analyzer = semantic_analyzer
         self.group_thresholds = {
-            # значения по умолчанию; подбираются на разметке. Можно тонко настроить по группам.
+            # Значения по умолчанию; подбираются на разметке. Можно тонко настроить по группам.
             "Источник финансирования": 0.88,
             "Требования к сроку годности": 0.90,
             "Порядок оплаты товаров": 0.90,
@@ -595,7 +595,7 @@ class DocumentParser:
 
 
     def _check_keywords_in_text(self, text, keywords):
-        #метод проверяет, содержит ли текст хотя бы одно из ключевых слов
+        # метод проверяет, содержит ли текст хотя бы одно из ключевых слов
 
         text_lower = text.lower()
         for keyword in keywords:
@@ -745,7 +745,7 @@ class DocumentParser:
                     self.contract_date = date
 
     def _process_contract_date(self):
-        #метод обрабатывает специальную группу "Срок действия контракта"
+        # метод обрабатывает специальную группу "Срок действия контракта"
 
         if self.contract_date:
             self.groups["Срок действия контракта"] = [self.contract_date]
@@ -870,7 +870,11 @@ def save_to_db(number, data):
         # 1. Обновляем таблицу [Tender]
         query_tender = """
         UPDATE [Cursor].[dbo].[Tender]
-        SET TenderDocReglament = ?, RequirementToExpiryDate = ?, PaymentReglament = ?
+        SET 
+            TenderDocReglament = ?, 
+            RequirementToExpiryDate = ?, 
+            PaymentReglament = ?,
+            UPDDATE = GETDATE()
         WHERE NotifNr = ?
         """
         cursor.execute(query_tender, (fs, sl, pt, number))
@@ -882,7 +886,8 @@ def save_to_db(number, data):
         SET  
             l.PlanTVal = ?, 
             l.ContrExpVal = ?, 
-            l.SupplyDt = ?
+            l.SupplyDt = ?,
+            l.UPDDATE = GETDATE()
         FROM [Cursor].[dbo].[Lot] l
         INNER JOIN [Cursor].[dbo].[Tender] t ON l.Tender_id = t.tender_id
         WHERE t.NotifNr = ?
