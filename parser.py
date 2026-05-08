@@ -2,6 +2,7 @@ import argparse
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from tempfile import NamedTemporaryFile
@@ -21,7 +22,7 @@ if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
 log_file = os.path.join(log_dir, "parser.log")
-handler = RotatingFileHandler(log_file, maxBytes=1*1024*1024, backupCount=3, encoding='utf-8')
+handler = RotatingFileHandler(log_file, maxBytes=20*1024*1024, backupCount=15, encoding='utf-8')
 
 logging.basicConfig(
     level=logging.INFO,
@@ -34,6 +35,10 @@ logging.basicConfig(
 load_dotenv()
 
 TIME_BEFORE = -int(os.getenv("TIME_BEFORE", "90"))
+USER_AUTO_44 = os.getenv("USER_AUTO_44")
+USER_AUTO_223 = os.getenv("USER_AUTO_223")
+USER_MEDIZD = os.getenv("USER_MEDIZD")
+REPORT_PATH = os.getenv('REPORT_PATH')
 
 class SemanticAnalyzer:
     """Класс для интеллектуального анализа текста на основе семантической схожести."""
@@ -303,14 +308,16 @@ class DocumentParser:
         for link in soup.find_all('a'):
             href = link.get('href', '')
             title = link.get('title', '')
-            text = link.get_text().strip()
+            data_tooltip = link.get('data-tooltip', '')
 
+            text = link.get_text().strip()
             # Игнорируем файлы по названию или ссылке
-            full_text = f"{text.lower()} {title.lower()} {href.lower()}"
+            full_text = f"{text.lower()} {title.lower()} {href.lower()} {data_tooltip.lower()}"
             if any(pattern in full_text for pattern in ignore_patterns):
                 continue
 
-            is_supported = any(ext in href.lower() or ext in title.lower() or ext in text.lower() for ext in extensions)
+            is_supported = any(ext in href.lower() or ext in title.lower() or ext in text.lower()
+                               or ext in data_tooltip.lower() for ext in extensions)
             
             if (is_supported or 'downloaddoc' in href.lower() or 'filestore' in href.lower()) and href:
                 full_url = urljoin(base_url, href)
@@ -559,7 +566,7 @@ class DocumentParser:
     def _get_223fz_notice_id(self, number):
         # метод имитирует поиск на сайте закупок для получения noticeInfoId (для 223-ФЗ)
 
-        search_url = f"https://zakupki.gov.ru/epz/order/extendedsearch/results.html?searchString={number}&morphology=on&pageNumber=1&sortDirection=false&recordsPerPage=_10&showLotsInfoHidden=false&sortBy=UPDATE_DATE&fz223=on&af=on&ca=on&pc=on&pa=on"
+        search_url = f"https://zakupki.gov.ru/epz/order/notice/notice223/common-info.html?regNumber={number}"
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
 
         max_repeats = 3
@@ -570,24 +577,21 @@ class DocumentParser:
                 response.raise_for_status()
                 soup = BeautifulSoup(response.text, 'html.parser')
 
-                results = soup.find_all('div', class_='search-registry-entry-block')
-                if not results:
-                    # попробуем другой класс, если сайт обновился
-                    results = soup.find_all('div', class_='registry-entry__form')
-
-                for res in results:
-                    # ищем ссылку с классом m-0 или просто ссылку в заголовке
-                    link_node = res.find('a', class_='m-0') or res.find('a', target='_blank')
-                    if link_node and link_node.get('href'):
-                        href = link_node['href']
-                        # вытаскиваем noticeInfoId из href
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    if 'html?noticeInfoId' in href:
                         match = re.search(r'noticeInfoId=(\d+)', href)
-                        if match:
-                            return match.group(1)
+                        if match and match.lastindex >= 1:
+                            notice_id = match.group(1)
+                            logging.info(f"Найден noticeInfoId: {notice_id}")
+                            return notice_id
 
                 logging.warning(f"Результаты поиска пусты для номера {number} (попытка {attempt + 1})")
             except Exception as e:
                 logging.error(f"Ошибка при поиске noticeInfoId (попытка {attempt + 1}): {e}")
+
+            if attempt < max_repeats - 1:
+                time.sleep(5)
 
         return None
 
@@ -798,6 +802,7 @@ def get_db_connection():
             f"UID={os.getenv('DB_USERNAME')};"
             f"PWD={os.getenv('DB_PASSWORD')};"
             "TrustServerCertificate=yes;"
+            "Command Timeout=5000"
         )
         return pyodbc.connect(conn_str)
     except Exception as e:
@@ -818,15 +823,24 @@ def get_numbers_from_db():
         cursor = conn.cursor()
 
         # Фильтруем те закупки, где t.PaymentReglament еще не заполнен (IS NULL)
-        query = """SELECT DISTINCT t.NotifNr, t.SrcInf
+        query = """
+                    SELECT DISTINCT t.NotifNr, t.SrcInf
                     FROM [Cursor].[dbo].[Tender] t
-                    INNER JOIN [Cursor].[dbo].[Lot] l (nolock) on l.Tender_id = t.tender_id
-                    INNER JOIN [Cursor].[dbo].[LotSpec] ls (nolock) on ls.lot_id = l.lot_id
-                    WHERE ((FZ_ID = 44 AND NotifNr NOT LIKE '[a-zA-Z]%' AND len(NotifNr) = 19) 
-                    OR (len(NotifNr) = 11 and NotifNr like '3%')) 
+                    INNER JOIN [Cursor].[dbo].[Lot] l (nolock) ON l.Tender_id = t.tender_id
+                    INNER JOIN [Cursor].[dbo].[LotSpec] ls (nolock) ON ls.lot_id = l.lot_id
+                    WHERE (
+                        (FZ_ID = 44 AND t.NotifNr NOT LIKE '[a-zA-Z]%' AND LEN(t.NotifNr) = 19 
+                        AND t.NotifNr NOT LIKE '77777%') 
+                        OR (LEN(t.NotifNr) = 11 AND t.NotifNr LIKE '3%')
+                    )
                     AND t.SYSDATE >= DATEADD(minute, ?, GETDATE()) 
-                    AND t.PaymentReglament IS NULL"""
-        cursor.execute(query, (TIME_BEFORE,))
+                    AND (t.PaymentReglament IS NULL OR t.PaymentReglament = '')
+                    AND (t.UserID IS NULL OR t.UserID <> ?)
+                    AND (t.OwnerID IS NULL OR t.OwnerID <> ?)
+                    AND (l.UserID IS NULL OR l.UserID <> ?)
+                    AND (l.OwnerID IS NULL OR l.OwnerID <> ?)
+                """
+        cursor.execute(query, (TIME_BEFORE, USER_MEDIZD, USER_MEDIZD, USER_MEDIZD, USER_MEDIZD))
         results = [{'number': row[0], 'url': row[1]} for row in cursor.fetchall()]
         conn.close()
         logging.info(f"Из БД загружено {len(results)} записей для обработки.")
@@ -839,7 +853,19 @@ def get_numbers_from_db():
 def save_to_db(number, data):
     #Сохранение результатов в БД
     logging.info(f"Сохранение результатов для закупки {number} в БД...")
-    
+
+    def _get_user_id(notif_nr):
+
+        if len(notif_nr) == 19:
+            return USER_AUTO_44
+        elif len(notif_nr) == 11:
+            return USER_AUTO_223
+
+        logging.warning(f"Не удалось определить тип ФЗ для номера {number}. UserID не будет установлен.")
+        return None
+
+    auto_user = _get_user_id(number)
+
     conn = get_db_connection()
     if not conn:
         logging.error(f"Подключение к БД не удалось. Данные для {number} не сохранены.")
@@ -873,26 +899,30 @@ def save_to_db(number, data):
         SET 
             TenderDocReglament = ?, 
             RequirementToExpiryDate = ?, 
-            PaymentReglament = ?,
+            PaymentReglament = LEFT(?, 3000),
+            UserID = ?,
+            OwnerID = ?,
             UPDDATE = GETDATE()
         WHERE NotifNr = ?
         """
-        cursor.execute(query_tender, (fs, sl, pt, number))
+        cursor.execute(query_tender, (fs, sl, pt, auto_user, auto_user, number))
         
         # 2. Обновляем таблицу [Lot]
         # Обновляем все лоты, связанные с этим номером закупки (через Tender_id)
         query_lot = """
         UPDATE l
         SET  
-            l.PlanTVal = ?, 
-            l.ContrExpVal = ?, 
+            l.PlanTVal = LEFT(?, 3000), 
+            l.ContrExpVal = LEFT(?, 250), 
             l.SupplyDt = ?,
+            l.UserID = ?,
+            l.OwnerID = ?,
             l.UPDDATE = GETDATE()
         FROM [Cursor].[dbo].[Lot] l
         INNER JOIN [Cursor].[dbo].[Tender] t ON l.Tender_id = t.tender_id
         WHERE t.NotifNr = ?
         """
-        cursor.execute(query_lot, (dt, cdn, cd, number))
+        cursor.execute(query_lot, (dt, cdn, cd, auto_user, auto_user, number))
         
         conn.commit()
         conn.close()
@@ -904,19 +934,19 @@ def save_to_db(number, data):
 def main():
     logging.info("Запуск парсера.")
     args = get_args()
-    
+
     # Инициализируем семантический анализатор один раз при запуске
     analyzer = None
     excel_path = "Данные из базы.xlsx"
     cache_path = "embeddings_cache.pt"
-    
+
     if os.path.exists(excel_path) or os.path.exists(cache_path):
         analyzer = SemanticAnalyzer(excel_path, cache_path=cache_path)
     else:
         logging.warning(f"Ни файл {excel_path}, ни кеш {cache_path} не найдены. Семантический поиск отключен.")
 
     parser = DocumentParser(semantic_analyzer=analyzer)
-    
+
     numbers = []
     
     if args.mode == 'file':
@@ -942,24 +972,33 @@ def main():
             # Сбрасываем группы перед каждым новым парсингом
             parser.groups = {group: [] for group in parser.groups_config.keys()}
             parser.contract_date = None
-            
+
             # Передаем и номер, и ссылку в метод парсинга
             groups = parser.parse_by_number(number, provided_url=url)
-            
+
             # Временный принт результатов для отладки
             # print(f"\n--- РЕЗУЛЬТАТЫ ДЛЯ {number} ---")
             # for group_name, sentences in groups.items():
             #     content = sentences[0] if sentences else "Нет данных"
             #     print(f"[{group_name}]: {content}")
             # print("-" * 30 + "\n")
-            
+
             # Сохранение в БД (временная заглушка)
             save_to_db(number, groups)
-            
+
             logging.info(f"Закупка {number} успешно обработана.")
 
         except Exception as e:
             logging.error(f"Критическая ошибка при обработке закупки {number}: {e}")
+
+    try:
+        os.makedirs(REPORT_PATH, exist_ok=True)
+        file_path = os.path.join(REPORT_PATH, 'numbers.txt')
+        with open(file_path, 'w', encoding='utf-8') as f:
+            f.write(numbers_block)
+        logging.info(f"Список номеров сохранен в: {file_path}")
+    except Exception as e:
+        logging.error(f"Ошибка при записи файла {file_path}: {e}")
 
     logging.info("Работа парсера завершена.")
 
